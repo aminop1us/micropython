@@ -30,10 +30,16 @@ async def handle_connection(reader, writer):
 async def tcp_server():
     global ev
 
-    server_ctx = tls.SSLContext( tls.PROTOCOL_TLS_SERVER )
-    def psk_server_callback( identity ):
-        return bytes.fromhex( "c0ffee" )
-    server_ctx.set_psk_server_callback( psk_server_callback )
+    server_ctx = tls.SSLContext(tls.PROTOCOL_TLS_SERVER)
+
+    def psk_server_callback(identity):
+        psk_dict = {
+            b"PSK-Identity-1" : bytes.fromhex( "c0ffee" ),
+            b"PSK-Identity-2" : bytes.fromhex( "facade" ),
+        }
+        return psk_dict[identity]
+
+    server_ctx.set_psk_server_callback(psk_server_callback)
 
     ev = asyncio.Event()
     server = await asyncio.start_server(handle_connection, "0.0.0.0", PORT, ssl=server_ctx)
@@ -45,9 +51,11 @@ async def tcp_server():
 
 async def tcp_client(message):
     client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    def psk_client_callback( identity ):
-        return (  b"PSK-Identity-1", bytes.fromhex( "c0ffee" ) )
-    ctx.set_psk_client_callback( psk_client_callback )
+
+    def psk_client_callback(identity):
+        return (b"PSK-Identity-1", bytes.fromhex("c0ffee"))
+
+    ctx.set_psk_client_callback(psk_client_callback)
 
     reader, writer = await asyncio.open_connection(IP, PORT, ssl=client_ctx)
     print("write:", message)
