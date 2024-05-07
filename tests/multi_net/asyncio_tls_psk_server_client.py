@@ -34,8 +34,8 @@ async def tcp_server():
 
     def psk_server_callback(identity):
         psk_dict = {
-            b"PSK-Identity-1" : bytes.fromhex( "c0ffee" ),
-            b"PSK-Identity-2" : bytes.fromhex( "facade" ),
+            b"PSK-Identity-1": bytes.fromhex("c0ffee"),
+            b"PSK-Identity-2": bytes.fromhex("facade"),
         }
         return psk_dict[identity]
 
