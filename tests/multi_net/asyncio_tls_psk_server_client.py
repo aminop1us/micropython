@@ -50,12 +50,12 @@ async def tcp_server():
 
 
 async def tcp_client(message):
-    client_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    client_ctx = tls.SSLContext(tls.PROTOCOL_TLS_CLIENT)
 
     def psk_client_callback(identity):
         return (b"PSK-Identity-1", bytes.fromhex("c0ffee"))
 
-    ctx.set_psk_client_callback(psk_client_callback)
+    client_ctx.set_psk_client_callback(psk_client_callback)
 
     reader, writer = await asyncio.open_connection(IP, PORT, ssl=client_ctx)
     print("write:", message)
