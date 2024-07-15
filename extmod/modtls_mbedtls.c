@@ -202,7 +202,7 @@ static int ssl_sock_cert_verify(void *ptr, mbedtls_x509_crt *crt, int depth, uin
 static int ssl_conf_psk_cb(void *parameter, mbedtls_ssl_context *ssl,
     const unsigned char *psk_identity, size_t psk_identity_len) {
     mp_obj_t callback = MP_OBJ_FROM_PTR(parameter);
-    mp_obj_t psk_identity_obj = mp_obj_new_bytes(psk_identity, psk_identity_len);
+    mp_obj_t psk_identity_obj = mp_obj_new_str((const char *)psk_identity, psk_identity_len);
 
     // Call the callback
     mp_obj_t psk_key_obj = mp_call_function_1(callback, psk_identity_obj);
