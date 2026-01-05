@@ -49,6 +49,7 @@ enum {
     PROXY_KIND_MP_GENERATOR = 7,
     PROXY_KIND_MP_OBJECT = 8,
     PROXY_KIND_MP_JSPROXY = 9,
+    PROXY_KIND_MP_EXISTING = 10,
 };
 
 enum {
@@ -58,8 +59,9 @@ enum {
     PROXY_KIND_JS_INTEGER = 3,
     PROXY_KIND_JS_DOUBLE = 4,
     PROXY_KIND_JS_STRING = 5,
-    PROXY_KIND_JS_OBJECT = 6,
-    PROXY_KIND_JS_PYPROXY = 7,
+    PROXY_KIND_JS_OBJECT_EXISTING = 6,
+    PROXY_KIND_JS_OBJECT = 7,
+    PROXY_KIND_JS_PYPROXY = 8,
 };
 
 MP_DEFINE_CONST_OBJ_TYPE(
@@ -79,32 +81,61 @@ static size_t proxy_c_ref_next;
 
 void proxy_c_init(void) {
     MP_STATE_PORT(proxy_c_ref) = mp_obj_new_list(0, NULL);
+    MP_STATE_PORT(proxy_c_dict) = mp_obj_new_dict(0);
     mp_obj_list_append(MP_STATE_PORT(proxy_c_ref), MP_OBJ_NULL);
     proxy_c_ref_next = PROXY_C_REF_NUM_STATIC;
+
+    void mp_obj_jsproxy_init(void);
+    mp_obj_jsproxy_init();
 }
 
 MP_REGISTER_ROOT_POINTER(mp_obj_t proxy_c_ref);
+MP_REGISTER_ROOT_POINTER(mp_obj_t proxy_c_dict);
 
 // obj cannot be MP_OBJ_NULL.
 static inline size_t proxy_c_add_obj(mp_obj_t obj) {
     // Search for the first free slot in proxy_c_ref.
+    size_t id = 0;
     mp_obj_list_t *l = (mp_obj_list_t *)MP_OBJ_TO_PTR(MP_STATE_PORT(proxy_c_ref));
     while (proxy_c_ref_next < l->len) {
         if (l->items[proxy_c_ref_next] == MP_OBJ_NULL) {
             // Free slot found, reuse it.
-            size_t id = proxy_c_ref_next;
+            id = proxy_c_ref_next;
             ++proxy_c_ref_next;
             l->items[id] = obj;
-            return id;
+            break;
         }
         ++proxy_c_ref_next;
     }
 
-    // No free slots, so grow proxy_c_ref by one (append at the end of the list).
-    size_t id = l->len;
-    mp_obj_list_append(MP_STATE_PORT(proxy_c_ref), obj);
-    proxy_c_ref_next = l->len;
+    if (id == 0) {
+        // No free slots, so grow proxy_c_ref by one (append at the end of the list).
+        id = l->len;
+        mp_obj_list_append(MP_STATE_PORT(proxy_c_ref), obj);
+        proxy_c_ref_next = l->len;
+    }
+
+    // Add the object to proxy_c_dict, keyed by the object pointer, with value the object id.
+    mp_obj_t obj_key = mp_obj_new_int_from_uint((uintptr_t)obj);
+    mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND);
+    elem->value = mp_obj_new_int_from_uint(id);
+
     return id;
+}
+
+EM_JS(int, js_check_existing, (int c_ref), {
+    return proxy_js_check_existing(c_ref);
+});
+
+// obj cannot be MP_OBJ_NULL.
+static inline int proxy_c_check_existing(mp_obj_t obj) {
+    mp_obj_t obj_key = mp_obj_new_int_from_uint((uintptr_t)obj);
+    mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP);
+    if (elem == NULL) {
+        return -1;
+    }
+    uint32_t c_ref = mp_obj_int_get_truncated(elem->value);
+    return js_check_existing(c_ref);
 }
 
 static inline mp_obj_t proxy_c_get_obj(uint32_t c_ref) {
@@ -113,6 +144,16 @@ static inline mp_obj_t proxy_c_get_obj(uint32_t c_ref) {
 
 void proxy_c_free_obj(uint32_t c_ref) {
     if (c_ref >= PROXY_C_REF_NUM_STATIC) {
+        // Remove the object from proxy_c_dict if the c_ref in that dict corresponds to this object.
+        // (It may be that this object exists in the dict but with a different c_ref from a more
+        // recent proxy of this object.)
+        mp_obj_t obj_key = mp_obj_new_int_from_uint((uintptr_t)proxy_c_get_obj(c_ref));
+        mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP);
+        if (elem != NULL && mp_obj_int_get_truncated(elem->value) == c_ref) {
+            mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP_REMOVE_IF_FOUND);
+        }
+
+        // Clear the slot in proxy_c_ref used by this object, so the GC can reclaim the object.
         ((mp_obj_list_t *)MP_OBJ_TO_PTR(MP_STATE_PORT(proxy_c_ref)))->items[c_ref] = MP_OBJ_NULL;
         proxy_c_ref_next = MIN(proxy_c_ref_next, c_ref);
     }
@@ -135,6 +176,8 @@ mp_obj_t proxy_convert_js_to_mp_obj_cside(uint32_t *value) {
         return s;
     } else if (value[0] == PROXY_KIND_JS_PYPROXY) {
         return proxy_c_get_obj(value[1]);
+    } else if (value[0] == PROXY_KIND_JS_OBJECT_EXISTING) {
+        return mp_obj_get_jsproxy(value[1]);
     } else {
         // PROXY_KIND_JS_OBJECT
         return mp_obj_new_jsproxy(value[1]);
@@ -143,6 +186,7 @@ mp_obj_t proxy_convert_js_to_mp_obj_cside(uint32_t *value) {
 
 void proxy_convert_mp_to_js_obj_cside(mp_obj_t obj, uint32_t *out) {
     uint32_t kind;
+    int js_ref;
     if (obj == MP_OBJ_NULL) {
         kind = PROXY_KIND_MP_NULL;
     } else if (obj == mp_const_none) {
@@ -164,10 +208,13 @@ void proxy_convert_mp_to_js_obj_cside(mp_obj_t obj, uint32_t *out) {
         out[2] = (uintptr_t)str;
     } else if (obj == mp_const_undefined) {
         kind = PROXY_KIND_MP_JSPROXY;
-        out[1] = 1;
+        out[1] = MP_OBJ_JSPROXY_REF_UNDEFINED;
     } else if (mp_obj_is_jsproxy(obj)) {
         kind = PROXY_KIND_MP_JSPROXY;
         out[1] = mp_obj_jsproxy_get_ref(obj);
+    } else if ((js_ref = proxy_c_check_existing(obj)) >= 0) {
+        kind = PROXY_KIND_MP_EXISTING;
+        out[1] = js_ref;
     } else if (mp_obj_get_type(obj) == &mp_type_JsException) {
         mp_obj_exception_t *exc = MP_OBJ_TO_PTR(obj);
         if (exc->args->len > 0 && mp_obj_is_jsproxy(exc->args->items[0])) {
@@ -216,13 +263,12 @@ void proxy_c_to_js_call(uint32_t c_ref, uint32_t n_args, uint32_t *args_value, u
         mp_obj_t obj = proxy_c_get_obj(c_ref);
         mp_obj_t member = mp_call_function_n_kw(obj, n_args, 0, args);
         nlr_pop();
-        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(member, out);
     } else {
         // uncaught exception
-        external_call_depth_dec();
         proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
     }
+    external_call_depth_dec();
 }
 
 void proxy_c_to_js_dir(uint32_t c_ref, uint32_t *out) {
@@ -244,13 +290,12 @@ void proxy_c_to_js_dir(uint32_t c_ref, uint32_t *out) {
             dir = mp_builtin_dir_obj.fun.var(1, args);
         }
         nlr_pop();
-        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(dir, out);
     } else {
         // uncaught exception
-        external_call_depth_dec();
         proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
     }
+    external_call_depth_dec();
 }
 
 bool proxy_c_to_js_has_attr(uint32_t c_ref, const char *attr_in) {
@@ -292,13 +337,12 @@ void proxy_c_to_js_lookup_attr(uint32_t c_ref, const char *attr_in, uint32_t *ou
             member = mp_load_attr(obj, attr);
         }
         nlr_pop();
-        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(member, out);
     } else {
         // uncaught exception
-        external_call_depth_dec();
         proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
     }
+    external_call_depth_dec();
 }
 
 static bool proxy_c_to_js_store_helper(uint32_t c_ref, const char *attr_in, uint32_t *value_in) {
@@ -409,16 +453,17 @@ bool proxy_c_to_js_iternext(uint32_t c_ref, uint32_t *out) {
             return false;
         }
         nlr_pop();
-        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(iter, out);
+        external_call_depth_dec();
         return true;
     } else {
-        external_call_depth_dec();
         if (mp_obj_is_subclass_fast(MP_OBJ_FROM_PTR(((mp_obj_base_t *)nlr.ret_val)->type), MP_OBJ_FROM_PTR(&mp_type_StopIteration))) {
+            external_call_depth_dec();
             return false;
         } else {
             // uncaught exception
             proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
+            external_call_depth_dec();
             return true;
         }
     }
@@ -564,11 +609,10 @@ void proxy_c_to_js_resume(uint32_t c_ref, uint32_t *args) {
         mp_obj_t reject = proxy_convert_js_to_mp_obj_cside(args + 2 * 3);
         mp_obj_t ret = proxy_resume_execute(obj, mp_const_none, mp_const_none, resolve, reject);
         nlr_pop();
-        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(ret, args);
     } else {
         // uncaught exception
-        external_call_depth_dec();
         proxy_convert_mp_to_js_exc_cside(nlr.ret_val, args);
     }
+    external_call_depth_dec();
 }
